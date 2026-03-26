@@ -1,183 +1,378 @@
+"""
+handop.py – Air Canvas: touchless drawing via hand gesture recognition.
+
+Uses MediaPipe Hands to track the index-finger tip in real time.
+Pinching the index finger and thumb together activates the pen; moving
+them apart lifts the pen.  A toolbar on the right edge of the window
+lets you pick colours, switch to the eraser, clear the canvas, or exit.
+
+Usage
+-----
+    python handop.py
+
+Controls
+--------
+    Pinch gesture  – draw / write on the canvas
+    Open hand      – move cursor without drawing
+    Toolbar hover  – select colour, eraser, clear, or exit
+    Q key          – quit the application
+"""
+
+import sys
+
 import cv2
 import mediapipe as mp
 import numpy as np
-import re
 
-# Initialize the MediaPipe Hands module
+from config import CanvasConfig
+
+
+# ── MediaPipe initialisation ───────────────────────────────────────────────────
+
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
 mp_drawing = mp.solutions.drawing_utils
 
-# Initialize the webcam
-cap = cv2.VideoCapture(0)
 
-# Drawing variables
-drawing_color = (0, 255, 0)  # Default green color
-thickness = 5  # Thickness of the pen
-eraser_thickness = 50
-prev_x, prev_y = None, None
-drawing = False
+# ── Helper functions ───────────────────────────────────────────────────────────
 
-# Create a canvas for drawing
-canvas = None
+def build_buttons(frame_width, cfg):
+    """Compute pixel bounding boxes for every toolbar button.
 
-# Track the selected button
-selected_button = None  # <-- Add here
+    The toolbar is a vertical strip on the *right* edge of the frame.
+    Each entry maps a button name to ``(x1, y1, x2, y2)``.
 
-# Taskbar dimensions
-taskbar_width = 50
-button_size = 50
-button_spacing = 60  # Space between buttons
+    Parameters
+    ----------
+    frame_width : int
+        Width of the video frame in pixels.
+    cfg : CanvasConfig
+        Application configuration instance.
 
-# Button positions will be initialized later once we have the frame height
-buttons = {}
+    Returns
+    -------
+    dict
+        Button name -> (left, top, right, bottom) bounding box.
+    """
+    tw = cfg.TASKBAR_WIDTH
+    bs = cfg.BUTTON_SIZE
+    sp = cfg.BUTTON_SPACING
+    w = frame_width
+
+    button_names = ["red", "green", "blue", "yellow", "purple", "orange", "eraser", "clear", "exit"]
+    buttons = {}
+    for i, name in enumerate(button_names):
+        x1 = w - tw
+        y1 = 10 + i * sp
+        x2 = w - 10
+        y2 = 10 + bs + i * sp
+        buttons[name] = (x1, y1, x2, y2)
+    return buttons
 
 
-# Set up the OpenCV window in normal mode
-cv2.namedWindow('Hand Detection', cv2.WINDOW_NORMAL)
-cv2.resizeWindow('Hand Detection', 1280, 720)  # Optional, adjust as needed
+def create_canvas(frame):
+    """Return a blank white canvas with the same shape as *frame*.
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        print("Failed to grab frame")
-        break
+    Parameters
+    ----------
+    frame : numpy.ndarray
+        Reference BGR video frame used to determine canvas dimensions.
 
-    # Flip the frame horizontally for a selfie-view display
-    frame = cv2.flip(frame, 1)
+    Returns
+    -------
+    numpy.ndarray
+        White (255, 255, 255) canvas array matching *frame* shape.
+    """
+    return np.ones_like(frame, dtype=np.uint8) * 255
 
-    # Initialize the canvas if not already done
-    if canvas is None:
-        canvas = np.ones_like(frame) * 255  # White background
 
-    # Get frame dimensions
-    h, w, _ = frame.shape
+def is_pinching(x, y, thumb_x, thumb_y, threshold):
+    """Determine whether the index finger and thumb form a pinch gesture.
 
-    # Initialize button positions after getting frame height
-    if not buttons:
-        buttons = {
-            'red': (w - taskbar_width, 10, w - 10, 10 + button_size),
-            'green': (w - taskbar_width, 10 + button_spacing, w - 10, 10 + button_size + button_spacing),
-            'blue': (w - taskbar_width, 10 + 2 * button_spacing, w - 10, 10 + button_size + 2 * button_spacing),
-            'yellow': (w - taskbar_width, 10 + 3 * button_spacing, w - 10, 10 + button_size + 3 * button_spacing),
-            'purple': (w - taskbar_width, 10 + 4 * button_spacing, w - 10, 10 + button_size + 4 * button_spacing),
-            'orange': (w - taskbar_width, 10 + 5 * button_spacing, w - 10, 10 + button_size + 5 * button_spacing),
-            'eraser': (w - taskbar_width, 10 + 6 * button_spacing, w - 10, 10 + button_size + 6 * button_spacing),
-            'clear': (w - taskbar_width, 10 + 7 * button_spacing, w - 10, 10 + button_size + 7 * button_spacing),
-            'exit': (w - taskbar_width, 10 + 8 * button_spacing, w - 10, 10 + button_size + 8 * button_spacing)
-        }
+    Parameters
+    ----------
+    x, y : int
+        Pixel coordinates of the index-finger tip.
+    thumb_x, thumb_y : int
+        Pixel coordinates of the thumb tip.
+    threshold : int
+        Maximum pixel distance that counts as a pinch.
 
-    # Convert the BGR image to RGB
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    Returns
+    -------
+    bool
+        ``True`` when the two tips are within *threshold* pixels.
+    """
+    return abs(x - thumb_x) < threshold and abs(y - thumb_y) < threshold
 
-    # Process the frame and detect hands
-    results = hands.process(rgb_frame)
 
-    # Check for hand landmarks
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            # Get the landmark position of the index finger tip (landmark 8)
-            index_finger_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-            thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+def draw_toolbar(frame, buttons, selected_button, cfg):
+    """Render colour swatches and action buttons onto *frame* in-place.
 
-            # Convert normalized coordinates to pixel values
-            x = int(index_finger_tip.x * w)
-            y = int(index_finger_tip.y * h)
-            thumb_x = int(thumb_tip.x * w)
-            thumb_y = int(thumb_tip.y * h)
+    Parameters
+    ----------
+    frame : numpy.ndarray
+        BGR image to draw on (modified in-place).
+    buttons : dict
+        Button bounding boxes returned by :func:`build_buttons`.
+    selected_button : str or None
+        Name of the currently active button (receives a white highlight).
+    cfg : CanvasConfig
+        Application configuration instance (used for colour values).
+    """
+    for button, (x1, y1, x2, y2) in buttons.items():
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
 
-            # Check if the hand is in a writing gesture (index finger and thumb close together)
-            if abs(x - thumb_x) < 30 and abs(y - thumb_y) < 30:
-                drawing = True
+        # Highlight the active button with a white border
+        if button == selected_button:
+            cv2.rectangle(frame, (x1 - 5, y1 - 5), (x2 + 5, y2 + 5), (255, 255, 255), 3)
+
+        if button in cfg.COLORS:
+            # Draw a filled circle in the button's colour
+            cv2.circle(frame, (cx, cy), 20, cfg.COLORS[button], -1)
+        elif button == "eraser":
+            cv2.rectangle(frame, (x1 + 10, y1 + 10), (x2 - 10, y2 - 10), (0, 0, 0), -1)
+        elif button == "clear":
+            cv2.putText(frame, "C", (cx - 10, cy + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        elif button == "exit":
+            cv2.putText(frame, "X", (cx - 10, cy + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+
+def handle_button_click(button, canvas, frame, cfg):
+    """Apply the side-effect of clicking a toolbar *button*.
+
+    Parameters
+    ----------
+    button : str
+        Name of the button that was activated.
+    canvas : numpy.ndarray
+        Current drawing canvas (may be replaced on "clear").
+    frame : numpy.ndarray
+        Current video frame (used to size a fresh canvas).
+    cfg : CanvasConfig
+        Application configuration instance.
+
+    Returns
+    -------
+    tuple
+        Updated ``(drawing_color, thickness, canvas)`` triple.
+        If *button* is "exit" the process is terminated.
+    """
+    drawing_color = cfg.DEFAULT_COLOR
+    thickness = cfg.DEFAULT_THICKNESS
+
+    if button in cfg.COLORS:
+        drawing_color = cfg.COLORS[button]
+        thickness = cfg.DEFAULT_THICKNESS
+    elif button == "eraser":
+        drawing_color = (0, 0, 0)  # Black erases on a white canvas
+        thickness = cfg.ERASER_THICKNESS
+    elif button == "clear":
+        canvas = create_canvas(frame)
+    elif button == "exit":
+        sys.exit(0)
+
+    return drawing_color, thickness, canvas
+
+
+def process_landmarks(
+    hand_landmarks,
+    frame_width,
+    frame_height,
+    canvas,
+    prev_x,
+    prev_y,
+    drawing,
+    drawing_color,
+    thickness,
+    selected_button,
+    buttons,
+    cfg,
+    frame,
+):
+    """Extract finger positions, detect gestures, and update canvas/state.
+
+    Parameters
+    ----------
+    hand_landmarks : mediapipe landmark list
+        Detected hand landmarks from MediaPipe.
+    frame_width, frame_height : int
+        Dimensions of the current video frame in pixels.
+    canvas : numpy.ndarray
+        Current drawing canvas (may be mutated by draw strokes or clear).
+    prev_x, prev_y : int or None
+        Previous index-finger tip position for continuous line drawing.
+    drawing : bool
+        Whether the pen was active in the previous frame.
+    drawing_color : tuple
+        Current BGR pen colour.
+    thickness : int
+        Current pen/eraser stroke width.
+    selected_button : str or None
+        Currently selected toolbar button name.
+    buttons : dict
+        Toolbar button bounding boxes.
+    cfg : CanvasConfig
+        Application configuration instance.
+    frame : numpy.ndarray
+        Current video frame (used when a "clear" resets the canvas).
+
+    Returns
+    -------
+    tuple
+        ``(prev_x, prev_y, drawing, drawing_color, thickness,
+           selected_button, canvas)``
+    """
+    # Resolve index-finger tip and thumb tip to pixel coordinates
+    index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+    thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+
+    x = int(index_tip.x * frame_width)
+    y = int(index_tip.y * frame_height)
+    thumb_x = int(thumb_tip.x * frame_width)
+    thumb_y = int(thumb_tip.y * frame_height)
+
+    # Detect pinch gesture -> pen active
+    drawing = is_pinching(x, y, thumb_x, thumb_y, cfg.PINCH_THRESHOLD)
+
+    # Draw a continuous stroke on the canvas when the pen is active
+    if prev_x is not None and prev_y is not None and drawing:
+        cv2.line(canvas, (prev_x, prev_y), (x, y), drawing_color, thickness)
+
+    # Check whether the finger is hovering over the toolbar
+    if x > frame_width - cfg.TASKBAR_WIDTH:
+        for button, (x1, y1, x2, y2) in buttons.items():
+            if x1 < x < x2 and y1 < y < y2:
+                selected_button = button
+                drawing_color, thickness, canvas = handle_button_click(
+                    button, canvas, frame, cfg
+                )
+                prev_x, prev_y = None, None  # Lift pen when entering toolbar
+    else:
+        # Only update previous position when outside the toolbar
+        prev_x, prev_y = x, y
+
+    return prev_x, prev_y, drawing, drawing_color, thickness, selected_button, canvas
+
+
+# ── Main application loop ──────────────────────────────────────────────────────
+
+def main():
+    """Entry point: open webcam, run detection loop, clean up on exit.
+
+    The function initialises the webcam, the MediaPipe Hands detector,
+    and an OpenCV window, then processes frames until the user presses
+    **Q** or activates the exit button in the toolbar.
+
+    Raises
+    ------
+    RuntimeError
+        If the webcam cannot be opened.
+    """
+    cfg = CanvasConfig()
+
+    # Initialise MediaPipe Hands detector
+    hands = mp_hands.Hands(
+        max_num_hands=cfg.MAX_NUM_HANDS,
+        min_detection_confidence=cfg.MIN_DETECTION_CONFIDENCE,
+        min_tracking_confidence=cfg.MIN_TRACKING_CONFIDENCE,
+    )
+
+    # Open the default webcam
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError(
+            "Could not open webcam. Make sure a camera is connected and not "
+            "in use by another application."
+        )
+
+    # Set up the display window
+    cv2.namedWindow(cfg.WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(cfg.WINDOW_TITLE, cfg.WINDOW_WIDTH, cfg.WINDOW_HEIGHT)
+
+    # State variables
+    canvas = None
+    buttons = {}
+    prev_x = None
+    prev_y = None
+    drawing = False
+    drawing_color = cfg.DEFAULT_COLOR
+    thickness = cfg.DEFAULT_THICKNESS
+    selected_button = None
+
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                print("Warning: failed to read frame from webcam.")
+                break
+
+            # Mirror the frame for a natural selfie-view experience
+            frame = cv2.flip(frame, 1)
+
+            # Initialise canvas and button layout on the first valid frame
+            h, w, _ = frame.shape
+            if canvas is None:
+                canvas = create_canvas(frame)
+            if not buttons:
+                buttons = build_buttons(w, cfg)
+
+            # Run hand landmark detection (MediaPipe expects RGB input)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(rgb_frame)
+
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    (
+                        prev_x, prev_y,
+                        drawing,
+                        drawing_color,
+                        thickness,
+                        selected_button,
+                        canvas,
+                    ) = process_landmarks(
+                        hand_landmarks,
+                        w, h,
+                        canvas,
+                        prev_x, prev_y,
+                        drawing,
+                        drawing_color,
+                        thickness,
+                        selected_button,
+                        buttons,
+                        cfg,
+                        frame,
+                    )
+
+                    # Draw a pointer circle at the index-finger tip location
+                    index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                    px = int(index_tip.x * w)
+                    py = int(index_tip.y * h)
+                    cv2.circle(frame, (px, py), cfg.POINTER_RADIUS, (255, 0, 0), -1)
             else:
+                # No hand detected - lift the pen to avoid ghost strokes
                 drawing = False
 
-            # If previous coordinates exist, draw on the canvas
-            if prev_x is not None and prev_y is not None:
-                if drawing:
-                    if drawing_color == (0, 0, 0):  # Eraser
-                        cv2.line(canvas, (prev_x, prev_y), (x, y), drawing_color, eraser_thickness)
-                    else:
-                        cv2.line(canvas, (prev_x, prev_y), (x, y), drawing_color, thickness)
+            # Blend the live camera feed with the drawing canvas
+            frame = cv2.addWeighted(frame, cfg.CANVAS_BLEND_ALPHA, canvas, cfg.CANVAS_BLEND_ALPHA, 0)
 
-            # Check if the index finger is in the taskbar area
-            if x > w - taskbar_width:
-                for button, (x1, y1, x2, y2) in buttons.items():
-                    if x1 < x < x2 and y1 < y < y2:
-                        selected_button = button  # Track the selected button
-                        if button == 'red':
-                            drawing_color = (0, 0, 255)
-                            thickness = 5
-                        elif button == 'green':
-                            drawing_color = (0, 255, 0)
-                            thickness = 5
-                        elif button == 'blue':
-                            drawing_color = (255, 0, 0)
-                            thickness = 5
-                        elif button == 'yellow':
-                            drawing_color = (0, 255, 255)  # Yellow
-                            thickness = 5
-                        elif button == 'purple':
-                            drawing_color = (128, 0, 128)  # Purple
-                            thickness = 5
-                        elif button == 'orange':
-                            drawing_color = (0, 165, 255)  # Orange
-                            thickness = 5
-                        elif button == 'eraser':
-                            drawing_color = (0, 0, 0)
-                            thickness = eraser_thickness
-                        elif button == 'clear':
-                            canvas = np.ones_like(frame) * 255
-                            prev_x, prev_y = None, None
-                        elif button == 'exit':
-                            cap.release()
-                            cv2.destroyAllWindows()
-                            exit(0)  # Exit the program
+            # Render toolbar on top of the blended frame
+            draw_toolbar(frame, buttons, selected_button, cfg)
 
-            else:
-                prev_x, prev_y = x, y
+            cv2.imshow(cfg.WINDOW_TITLE, frame)
 
-            # Draw pointer
-            cv2.circle(frame, (x, y), 10, (255, 0, 0), -1)
-    else:
-        drawing = False
+            # Allow the user to quit with the Q key
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
-    # Combine the frame and canvas
-    frame = cv2.addWeighted(frame, 0.5, canvas, 0.5, 0)
+    except KeyboardInterrupt:
+        # Graceful exit on Ctrl-C
+        pass
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        hands.close()
 
-    # Draw buttons on the frame
-    for button, (x1, y1, x2, y2) in buttons.items():
-        # Highlight the selected button
-        if button == selected_button:
-            cv2.rectangle(frame, (x1 - 5, y1 - 5), (x2 + 5, y2 + 5), (255, 255, 255), 3)  # White border highlight
 
-        if button == 'red':
-            cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 20, (0, 0, 255), -1)
-        elif button == 'green':
-            cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 20, (0, 255, 0), -1)
-        elif button == 'blue':
-            cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 20, (255, 0, 0), -1)
-        elif button == 'yellow':
-            cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 20, (0, 255, 255), -1)  # Yellow
-        elif button == 'purple':
-            cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 20, (128, 0, 128), -1)  # Purple
-        elif button == 'orange':
-            cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 20, (0, 165, 255), -1)  # Orange
-        elif button == 'eraser':
-            cv2.rectangle(frame, (x1 + 10, y1 + 10), (x2 - 10, y2 - 10), (0, 0, 0), -1)
-        elif button == 'clear':
-            cv2.putText(frame, 'C', ((x1 + x2) // 2 - 10, (y1 + y2) // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        (255, 255, 255), 2)
-        elif button == 'exit':
-            cv2.putText(frame, 'X', ((x1 + x2) // 2 - 10, (y1 + y2) // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        (255, 255, 255), 2)
-
-    # Display the frame
-    cv2.imshow('Hand Detection', frame)
-
-    # Break the loop if 'q' is pressed
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
